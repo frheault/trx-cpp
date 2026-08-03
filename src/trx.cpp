@@ -716,32 +716,43 @@ AnyTrxFile::_create_from_pointer(json header,
     }
   }
 
-  if (trx.positions.empty() || trx.offsets.empty()) {
-    throw TrxFormatError("Missing essential data.");
-  }
-
-  const size_t offsets_count = trx.offsets.size();
-  if (offsets_count > 0) {
-    trx.offsets_u64.resize(offsets_count);
-    const auto bytes = trx.offsets.to_bytes();
-    if (trx.offsets.dtype == "uint64") {
-      const auto *src = reinterpret_cast<const uint64_t *>(bytes.data);
-      for (size_t i = 0; i < offsets_count; ++i) {
-        trx.offsets_u64[i] = src[i];
-      }
-    } else if (trx.offsets.dtype == "uint32") {
-      const auto *src = reinterpret_cast<const uint32_t *>(bytes.data);
-      for (size_t i = 0; i < offsets_count; ++i) {
-        trx.offsets_u64[i] = static_cast<uint64_t>(src[i]);
-      }
+  if (trx.positions.empty()) {
+    if (nb_vertices == 0) {
+      trx.positions = make_typed_array("positions.3.float16", 0, 3, "float16", 0);
     } else {
-      throw TrxDTypeError("Unsupported offsets datatype: " + trx.offsets.dtype);
+      throw TrxFormatError("Missing essential data: positions.");
+    }
+  }
+  if (trx.offsets.empty()) {
+    if (nb_streamlines == 0) {
+      trx.offsets_u64.push_back(0);
+    } else {
+      throw TrxFormatError("Missing essential data: offsets.");
+    }
+  } else {
+    const size_t offsets_count = trx.offsets.size();
+    if (offsets_count > 0) {
+      trx.offsets_u64.resize(offsets_count);
+      const auto bytes = trx.offsets.to_bytes();
+      if (trx.offsets.dtype == "uint64") {
+        const auto *src = reinterpret_cast<const uint64_t *>(bytes.data);
+        for (size_t i = 0; i < offsets_count; ++i) {
+          trx.offsets_u64[i] = src[i];
+        }
+      } else if (trx.offsets.dtype == "uint32") {
+        const auto *src = reinterpret_cast<const uint32_t *>(bytes.data);
+        for (size_t i = 0; i < offsets_count; ++i) {
+          trx.offsets_u64[i] = static_cast<uint64_t>(src[i]);
+        }
+      } else {
+        throw TrxDTypeError("Unsupported offsets datatype: " + trx.offsets.dtype);
+      }
     }
   }
 
-  if (offsets_count > 1) {
-    trx.lengths.resize(offsets_count - 1);
-    for (size_t i = 0; i + 1 < offsets_count; ++i) {
+  if (trx.offsets_u64.size() > 1) {
+    trx.lengths.resize(trx.offsets_u64.size() - 1);
+    for (size_t i = 0; i < trx.lengths.size(); ++i) {
       const uint64_t diff = trx.offsets_u64[i + 1] - trx.offsets_u64[i];
       if (diff > std::numeric_limits<uint32_t>::max()) {
         throw TrxFormatError("Offset difference exceeds uint32 range");
@@ -1144,7 +1155,8 @@ void AnyTrxFile::save(const std::string &filename, const TrxSaveOptions &options
       // dpg
       for (const auto& [sub_folder, map_arr] : data_per_group) {
           for (const auto& [name, arr] : map_arr) {
-              std::string name_ext = "dpg/" + sub_folder + "/" + name + "." + arr.dtype;
+              std::string name_ext = "dpg/" + sub_folder + "/" + name + "." + std::to_string(arr.cols) + "." + arr.dtype;
+              if (arr.cols <= 1) name_ext = "dpg/" + sub_folder + "/" + name + "." + arr.dtype;
               writer.add_file(name_ext, reinterpret_cast<const char*>(arr.to_bytes().data), arr.to_bytes().size);
           }
       }

@@ -599,9 +599,11 @@ TrxFile<DT>::_create_trx_from_pointer(json header,
       throw TrxFormatError("Entry is not part of a valid TRX structure: " + elem_filename);
     }
   }
-  if (trx->streamlines->_data.size() == 0 || trx->streamlines->_offsets.size() == 0) {
-
-    throw TrxFormatError("Missing essential data.");
+  if (trx->streamlines->_data.size() == 0 && trx->header["NB_VERTICES"].int_value() > 0) {
+    throw TrxFormatError("Missing essential data: positions.");
+  }
+  if (trx->streamlines->_offsets.size() == 0 && trx->header["NB_STREAMLINES"].int_value() > 0) {
+    throw TrxFormatError("Missing essential data: offsets.");
   }
 
   return trx;
