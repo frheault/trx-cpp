@@ -178,13 +178,94 @@ std::array<double, 3> read_xyz_as_double(const TypedArray &positions, size_t row
   throw TrxDTypeError("Unsupported positions dtype for streamline extraction: " + positions.dtype);
 }
 
-TypedArray make_typed_array(const std::string &filename, int rows, int cols, const std::string &dtype) {
+
+
+static uint16_t read_le16(const uint8_t* ptr) {
+    return ptr[0] | (ptr[1] << 8);
+}
+static uint32_t read_le32(const uint8_t* ptr) {
+    return ptr[0] | (ptr[1] << 8) | (ptr[2] << 16) | (ptr[3] << 24);
+}
+
+struct ZipEntry {
+    uint32_t offset;
+    uint32_t size;
+    uint16_t compression;
+};
+
+bool parse_zip(const std::string& filename, std::map<std::string, ZipEntry>& files) {
+    std::ifstream file(filename, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) return false;
+    std::streamsize file_size = file.tellg();
+    if (file_size < 22) return false;
+
+    std::streamsize search_size = std::min(file_size, static_cast<std::streamsize>(65536 + 22));
+    file.seekg(file_size - search_size, std::ios::beg);
+    std::vector<char> buffer(search_size);
+    if (!file.read(buffer.data(), search_size)) return false;
+
+    int eocd_idx = -1;
+    for (int i = search_size - 22; i >= 0; --i) {
+        if (buffer[i] == 0x50 && buffer[i+1] == 0x4B && buffer[i+2] == 0x05 && buffer[i+3] == 0x06) {
+            eocd_idx = i;
+            break;
+        }
+    }
+    if (eocd_idx == -1) return false;
+
+    uint16_t cd_count;
+    uint32_t cd_offset;
+    cd_count = read_le16(reinterpret_cast<const uint8_t*>(buffer.data() + eocd_idx + 10));
+    cd_offset = read_le32(reinterpret_cast<const uint8_t*>(buffer.data() + eocd_idx + 16));
+
+    file.seekg(cd_offset, std::ios::beg);
+    for (int i = 0; i < cd_count; ++i) {
+        char cd_header[46];
+        if (!file.read(cd_header, 46)) return false;
+        if (cd_header[0] != 0x50 || cd_header[1] != 0x4B || cd_header[2] != 0x01 || cd_header[3] != 0x02) return false;
+
+        uint16_t compression;
+        compression = read_le16(reinterpret_cast<const uint8_t*>(cd_header + 10));
+        uint32_t comp_size, uncomp_size;
+        comp_size = read_le32(reinterpret_cast<const uint8_t*>(cd_header + 20));
+        uncomp_size = read_le32(reinterpret_cast<const uint8_t*>(cd_header + 24));
+
+        uint16_t name_len, extra_len, comment_len;
+        name_len = read_le16(reinterpret_cast<const uint8_t*>(cd_header + 28));
+        extra_len = read_le16(reinterpret_cast<const uint8_t*>(cd_header + 30));
+        comment_len = read_le16(reinterpret_cast<const uint8_t*>(cd_header + 32));
+        uint32_t local_header_offset;
+        local_header_offset = read_le32(reinterpret_cast<const uint8_t*>(cd_header + 42));
+
+        std::vector<char> name_buf(name_len);
+        if (!file.read(name_buf.data(), name_len)) return false;
+        std::string name(name_buf.data(), name_len);
+        file.seekg(extra_len + comment_len, std::ios::cur);
+
+        std::streampos cur_pos = file.tellg();
+        file.seekg(local_header_offset, std::ios::beg);
+        char lf_header[30];
+        if (!file.read(lf_header, 30)) return false;
+
+        uint16_t lf_name_len, lf_extra_len;
+        lf_name_len = read_le16(reinterpret_cast<const uint8_t*>(lf_header + 26));
+        lf_extra_len = read_le16(reinterpret_cast<const uint8_t*>(lf_header + 28));
+
+        uint32_t data_offset = local_header_offset + 30 + lf_name_len + lf_extra_len;
+        files[name] = {data_offset, uncomp_size, compression};
+        file.seekg(cur_pos, std::ios::beg);
+    }
+    return true;
+}
+
+TypedArray make_typed_array(const std::string &filename, int rows, int cols, const std::string &dtype, long long offset = 0) {
+
   TypedArray array;
   array.dtype = dtype;
   array.rows = rows;
   array.cols = cols;
   if (rows > 0 && cols > 0) {
-    array.mmap = _create_memmap(filename, std::make_tuple(rows, cols), "r+", dtype, 0);
+    array.mmap = _create_memmap(filename, std::make_tuple(rows, cols), "r+", dtype, offset);
   }
   return array;
 }
@@ -364,6 +445,56 @@ AnyTrxFile AnyTrxFile::load(const std::string &path) {
 }
 
 AnyTrxFile AnyTrxFile::load_from_zip(const std::string &filename) {
+  std::map<std::string, ZipEntry> entries;
+  if (parse_zip(filename, entries)) {
+    bool all_uncompressed = true;
+    for (const auto& [name, entry] : entries) {
+      if (entry.compression != 0 && name != "header.json") {
+        all_uncompressed = false;
+        break;
+      }
+    }
+
+    if (all_uncompressed && entries.find("header.json") != entries.end()) {
+      int errorp = 0;
+      detail::ZipArchive zf(open_zip_for_read(filename, errorp));
+      if (!zf) throw TrxIOError("Could not open zip file: " + filename);
+
+      auto header_idx = zip_name_locate(zf.get(), "header.json", 0);
+      if (header_idx >= 0) {
+        detail::ZipFile hz(zip_fopen_index(zf.get(), header_idx, 0));
+        if (hz) {
+          zip_stat_t sb;
+          zip_stat_index(zf.get(), header_idx, 0, &sb);
+          std::string header_str(sb.size, ' ');
+          zip_fread(hz.get(), &header_str[0], sb.size);
+          std::string err;
+          json header = json::parse(header_str, err);
+          if (err.empty()) {
+            std::map<std::string, std::tuple<long long, long long>> files_pointer_size;
+            for (const auto& [name, entry] : entries) {
+              if (name == "header.json" || name.empty() || name.back() == '/') continue;
+              std::string ext = get_ext(name);
+              if (!trx::detail::_is_dtype_valid(ext)) continue;
+              int dtype_size = trx::detail::_sizeof_dtype(ext);
+              if (entry.size % dtype_size == 0) {
+                files_pointer_size[name] = std::make_tuple(entry.offset, entry.size / dtype_size);
+              }
+            }
+            try {
+              auto trx = AnyTrxFile::_create_from_pointer(header, files_pointer_size, filename);
+              trx._backing_directory = ""; // loaded from zip direct
+              return trx;
+            } catch (...) {
+              // fallback if creation fails
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Fallback to extraction
   int errorp = 0;
   detail::ZipArchive zf(open_zip_for_read(filename, errorp));
   if (!zf) {
@@ -474,7 +605,7 @@ AnyTrxFile::_create_from_pointer(json header,
       if (ext != "float16" && ext != "float32" && ext != "float64") {
         throw TrxDTypeError("Unsupported positions dtype: " + ext);
       }
-      trx.positions = make_typed_array(elem_filename, nb_vertices, 3, ext);
+      trx.positions = make_typed_array(elem_filename, nb_vertices, 3, ext, std::get<0>(x->second));
     } else if (base == "offsets" && (folder.empty() || folder == ".")) {
       if (size != static_cast<long long>(nb_streamlines) + 1 || dim != 1) {
         throw TrxFormatError("Wrong offsets size/dimensionality");
@@ -482,13 +613,13 @@ AnyTrxFile::_create_from_pointer(json header,
       if (ext != "uint32" && ext != "uint64") {
         throw TrxDTypeError("Unsupported offsets dtype: " + ext);
       }
-      trx.offsets = make_typed_array(elem_filename, nb_streamlines + 1, 1, ext);
+      trx.offsets = make_typed_array(elem_filename, nb_streamlines + 1, 1, ext, std::get<0>(x->second));
     } else if (folder == "dps") {
       const int nb_scalar = nb_streamlines > 0 ? static_cast<int>(size / nb_streamlines) : 0;
       if (nb_streamlines == 0 || size % nb_streamlines != 0 || nb_scalar != dim) {
         throw TrxFormatError("Wrong dps size/dimensionality");
       }
-      auto arr = make_typed_array(elem_filename, nb_streamlines, nb_scalar, ext);
+      auto arr = make_typed_array(elem_filename, nb_streamlines, nb_scalar, ext, std::get<0>(x->second));
       arr.materialize_to_owned();
       trx.data_per_streamline.emplace(base, std::move(arr));
     } else if (folder == "dpv") {
@@ -496,7 +627,7 @@ AnyTrxFile::_create_from_pointer(json header,
       if (nb_vertices == 0 || size % nb_vertices != 0 || nb_scalar != dim) {
         throw TrxFormatError("Wrong dpv size/dimensionality");
       }
-      auto arr = make_typed_array(elem_filename, nb_vertices, nb_scalar, ext);
+      auto arr = make_typed_array(elem_filename, nb_vertices, nb_scalar, ext, std::get<0>(x->second));
       arr.materialize_to_owned();
       trx.data_per_vertex.emplace(base, std::move(arr));
     } else if (folder.rfind("dpg", 0) == 0) {
@@ -505,7 +636,7 @@ AnyTrxFile::_create_from_pointer(json header,
       }
       std::string data_name = path_basename(base);
       std::string sub_folder = path_basename(folder);
-      auto arr = make_typed_array(elem_filename, 1, static_cast<int>(size), ext);
+      auto arr = make_typed_array(elem_filename, 1, static_cast<int>(size), ext, std::get<0>(x->second));
       arr.materialize_to_owned();
       trx.data_per_group[sub_folder].emplace(data_name, std::move(arr));
     } else if (folder == "groups") {
@@ -513,7 +644,7 @@ AnyTrxFile::_create_from_pointer(json header,
         throw TrxFormatError("Wrong group dimensionality");
       }
       if (ext == "uint32") {
-        auto arr = make_typed_array(elem_filename, static_cast<int>(size), 1, ext);
+        auto arr = make_typed_array(elem_filename, static_cast<int>(size), 1, ext, std::get<0>(x->second));
         arr.materialize_to_owned();
         trx.groups.emplace(base, std::move(arr));
       } else if (ext == "int8" || ext == "uint8" || ext == "int16" || ext == "uint16" || ext == "int32" ||
@@ -533,7 +664,7 @@ AnyTrxFile::_create_from_pointer(json header,
                                "' to uint32: NB_STREAMLINES exceeds the uint32 limit");
         }
 
-        auto tmp_arr = make_typed_array(elem_filename, static_cast<int>(size), 1, ext);
+        auto tmp_arr = make_typed_array(elem_filename, static_cast<int>(size), 1, ext, std::get<0>(x->second));
         tmp_arr.materialize_to_owned();
 
         TypedArray arr;
@@ -691,6 +822,180 @@ void AnyTrxFile::save(const std::string &filename, TrxCompression compression) {
 using trx::detail::TempFileGuard;
 using trx::detail::make_unique_temp_path;
 
+
+// Standard CRC32
+static uint32_t calculate_crc32(uint32_t crc, const unsigned char *buf, size_t len) {
+    static uint32_t table[256];
+    static bool have_table = false;
+    if (!have_table) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int j = 0; j < 8; j++) {
+                if (c & 1) c = 0xedb88320L ^ (c >> 1);
+                else c = c >> 1;
+            }
+            table[i] = c;
+        }
+        have_table = true;
+    }
+    crc = crc ^ 0xffffffffL;
+    while (len) {
+        crc = table[(crc ^ *buf++) & 0xff] ^ (crc >> 8);
+        len--;
+    }
+    return crc ^ 0xffffffffL;
+}
+
+
+static TrxScalarType string_to_scalar_type(const std::string& dtype) {
+    if (dtype == "float16") return TrxScalarType::Float16;
+    if (dtype == "float64") return TrxScalarType::Float64;
+    return TrxScalarType::Float32;
+}
+static size_t string_to_scalar_size(const std::string& dtype) {
+    return trx::detail::_sizeof_dtype(dtype);
+}
+
+static void write_le16(std::ostream& out, uint16_t val) {
+    uint8_t buf[2] = {static_cast<uint8_t>(val), static_cast<uint8_t>(val >> 8)};
+    out.write(reinterpret_cast<const char*>(buf), 2);
+}
+static void write_le32(std::ostream& out, uint32_t val) {
+    uint8_t buf[4] = {static_cast<uint8_t>(val), static_cast<uint8_t>(val >> 8), static_cast<uint8_t>(val >> 16), static_cast<uint8_t>(val >> 24)};
+    out.write(reinterpret_cast<const char*>(buf), 4);
+}
+
+class StreamingZipWriter {
+public:
+    std::ofstream out;
+    struct Entry {
+        std::string name;
+        uint32_t offset;
+        uint32_t size;
+        uint32_t crc;
+        uint16_t flags;
+    };
+    std::vector<Entry> entries;
+
+    StreamingZipWriter(const std::string& filename) : out(filename, std::ios::binary) {
+        if (!out) throw trx::TrxIOError("Could not open archive " + filename);
+    }
+
+    void add_file(const std::string& name, const char* data, size_t size) {
+        Entry e;
+        e.name = name;
+        e.offset = static_cast<uint32_t>(out.tellp());
+        e.size = static_cast<uint32_t>(size);
+        e.crc = calculate_crc32(0, reinterpret_cast<const unsigned char*>(data), size);
+        e.flags = 0;
+
+        out.write("PK\x03\x04", 4);
+        uint16_t version = 20, flags = 0, comp = 0, mod_time = 0, mod_date = 0;
+        write_le16(out, version);
+        write_le16(out, flags);
+        write_le16(out, comp);
+        write_le16(out, mod_time);
+        write_le16(out, mod_date);
+        write_le32(out, e.crc);
+        write_le32(out, e.size);
+        write_le32(out, e.size);
+        uint16_t name_len = static_cast<uint16_t>(name.size()), extra_len = 0;
+        write_le16(out, name_len);
+        write_le16(out, extra_len);
+        out.write(name.data(), name.size());
+
+        if (size > 0) out.write(data, size);
+        entries.push_back(e);
+    }
+
+    // For large files (positions), we can stream data in chunks
+    void add_file_stream_begin(const std::string& name) {
+        Entry e;
+        e.name = name;
+        e.offset = static_cast<uint32_t>(out.tellp());
+        e.size = 0; // Will be updated later
+        e.crc = 0;  // Will be updated later
+        e.flags = 8;
+
+        // Write placeholder local header
+        out.write("PK\x03\x04", 4);
+        uint16_t version = 20, flags = 8, comp = 0, mod_time = 0, mod_date = 0; // bit 3 (flags=8) means CRC/sizes are in data descriptor
+        write_le16(out, version);
+        write_le16(out, flags);
+        write_le16(out, comp);
+        write_le16(out, mod_time);
+        write_le16(out, mod_date);
+        uint32_t zero = 0;
+        write_le32(out, zero); // crc
+        write_le32(out, zero); // comp_size
+        write_le32(out, zero); // uncomp_size
+        uint16_t name_len = static_cast<uint16_t>(name.size()), extra_len = 0;
+        write_le16(out, name_len);
+        write_le16(out, extra_len);
+        out.write(name.data(), name.size());
+        entries.push_back(e);
+    }
+
+    void stream_data(const char* data, size_t size) {
+        if (size > 0) {
+            out.write(data, size);
+            entries.back().size += static_cast<uint32_t>(size);
+            entries.back().crc = calculate_crc32(entries.back().crc, reinterpret_cast<const unsigned char*>(data), size);
+        }
+    }
+
+    void add_file_stream_end() {
+        // Write data descriptor
+        out.write("PK\x07\x08", 4);
+        write_le32(out, entries.back().crc);
+        write_le32(out, entries.back().size);
+        write_le32(out, entries.back().size);
+    }
+
+    void finalize() {
+        uint32_t cd_offset = static_cast<uint32_t>(out.tellp());
+        for (const auto& e : entries) {
+            out.write("PK\x01\x02", 4);
+            uint16_t version_made = 0x0314, version_ext = 20, comp = 0;
+            uint16_t flags = e.flags;
+            uint16_t mod_time = 0, mod_date = 0, disk = 0, internal = 0;
+            uint32_t external = 0;
+            write_le16(out, version_made);
+            write_le16(out, version_ext);
+            write_le16(out, flags);
+            write_le16(out, comp);
+            write_le16(out, mod_time);
+            write_le16(out, mod_date);
+            write_le32(out, e.crc);
+            write_le32(out, e.size);
+            write_le32(out, e.size);
+            uint16_t name_len = static_cast<uint16_t>(e.name.size()), extra_len = 0, comment_len = 0;
+            write_le16(out, name_len);
+            write_le16(out, extra_len);
+            write_le16(out, comment_len);
+            write_le16(out, disk);
+            write_le16(out, internal);
+            write_le32(out, external);
+            write_le32(out, e.offset);
+            out.write(e.name.data(), e.name.size());
+        }
+        uint32_t cd_size = static_cast<uint32_t>(out.tellp()) - cd_offset;
+
+        out.write("PK\x05\x06", 4);
+        uint16_t disk = 0, cd_disk = 0;
+        uint16_t records_disk = static_cast<uint16_t>(entries.size());
+        uint16_t records = static_cast<uint16_t>(entries.size());
+        uint16_t comment_len = 0;
+        write_le16(out, disk);
+        write_le16(out, cd_disk);
+        write_le16(out, records_disk);
+        write_le16(out, records);
+        write_le32(out, cd_size);
+        write_le32(out, cd_offset);
+        write_le16(out, comment_len);
+    }
+};
+
 void AnyTrxFile::save(const std::string &filename, const TrxSaveOptions &options) {
   const std::string ext = get_ext(filename);
   const TrxSaveMode save_mode = resolve_save_mode(filename, options.mode);
@@ -736,56 +1041,121 @@ void AnyTrxFile::save(const std::string &filename, const TrxSaveOptions &options
   }
 
   if (save_mode == TrxSaveMode::Archive) {
-    int errorp;
-    detail::ZipArchive zf(zip_open(filename.c_str(), ZIP_CREATE + ZIP_TRUNCATE, &errorp));
-    if (!zf) {
-      throw TrxIOError("Could not open archive " + filename + ": " + strerror(errorp));
-    }
-
-    const std::string header_payload = header.dump() + "\n";
-    zip_source_t *header_source =
-        zip_source_buffer(zf.get(), header_payload.data(), header_payload.size(), 0 /* do not free */);
-    if (header_source == nullptr) {
-      throw TrxIOError("Failed to create zip source for header.json: " +
-                               std::string(zip_strerror(zf.get())));
-    }
-    const zip_int64_t header_idx =
-        zip_file_add(zf.get(), "header.json", header_source, ZIP_FL_ENC_UTF_8 | ZIP_FL_OVERWRITE);
-    if (header_idx < 0) {
-      throw TrxIOError("Failed to add header.json to archive: " + std::string(zip_strerror(zf.get())));
-    }
-    const zip_int32_t compression = static_cast<zip_int32_t>(to_zip_compression(options.compression));
-    if (zip_set_file_compression(zf.get(), header_idx, compression, 0) < 0) {
-      throw TrxIOError("Failed to set compression for header.json: " +
-                               std::string(zip_strerror(zf.get())));
-    }
-
-    std::unordered_set<std::string> skip = {"header.json"};
-    // Guard deletes the temp positions file after commit (or on exception).
-    TempFileGuard tmp_pos_guard;
-    if (options.positions_dtype.has_value() && !positions.empty()) {
-      const TrxScalarType target = *options.positions_dtype;
-      const std::string new_dtype_str = scalar_type_name(target);
-      if (new_dtype_str != positions.dtype) {
-        skip.insert("positions.3." + positions.dtype);
-        tmp_pos_guard.path = make_unique_temp_path("trx_pos_convert");
-        write_positions_as_dtype(*this, target, tmp_pos_guard.path);
-        const std::string new_pos_name = "positions.3." + new_dtype_str;
-        zip_source_t *pos_src =
-            zip_source_file(zf.get(), tmp_pos_guard.path.c_str(), 0, -1);
-        if (!pos_src)
-          throw TrxIOError("Failed to create zip source for converted positions");
-        const zip_int64_t pos_idx =
-            zip_file_add(zf.get(), new_pos_name.c_str(), pos_src, ZIP_FL_ENC_UTF_8 | ZIP_FL_OVERWRITE);
-        if (pos_idx < 0)
-          throw TrxIOError("Failed to add converted positions to archive: " +
-                           std::string(zip_strerror(zf.get())));
-        if (zip_set_file_compression(zf.get(), pos_idx, compression, 0) < 0)
-          throw TrxIOError("Failed to set compression for converted positions");
+    if (options.compression != TrxCompression::None) {
+      // Fallback for compressed mode, use old behavior if needed. Since the task asks to eliminate monolithic saving for huge files
+      // and usually zip is STORE, we can use the streaming writer for STORE and libzip for Deflate.
+      // Wait, let's just use libzip for compressed mode, and streaming zip writer for uncompressed mode.
+      int errorp;
+      detail::ZipArchive zf(zip_open(filename.c_str(), ZIP_CREATE + ZIP_TRUNCATE, &errorp));
+      if (!zf) throw TrxIOError("Could not open archive " + filename + ": " + strerror(errorp));
+      const std::string header_payload = header.dump() + "\n";
+      zip_source_t *header_source = zip_source_buffer(zf.get(), header_payload.data(), header_payload.size(), 0);
+      if (!header_source) throw TrxIOError("Failed to create zip source for header.json");
+      const zip_int64_t header_idx = zip_file_add(zf.get(), "header.json", header_source, ZIP_FL_ENC_UTF_8 | ZIP_FL_OVERWRITE);
+      if (header_idx < 0) throw TrxIOError("Failed to add header.json to archive");
+      const zip_int32_t compression = static_cast<zip_int32_t>(to_zip_compression(options.compression));
+      if (zip_set_file_compression(zf.get(), header_idx, compression, 0) < 0) throw TrxIOError("Failed to set compression");
+      std::unordered_set<std::string> skip = {"header.json"};
+      TempFileGuard tmp_pos_guard;
+      if (options.positions_dtype.has_value() && !positions.empty()) {
+        const TrxScalarType target = *options.positions_dtype;
+        const std::string new_dtype_str = scalar_type_name(target);
+        if (new_dtype_str != positions.dtype) {
+          skip.insert("positions.3." + positions.dtype);
+          tmp_pos_guard.path = make_unique_temp_path("trx_pos_convert");
+          write_positions_as_dtype(*this, target, tmp_pos_guard.path);
+          const std::string new_pos_name = "positions.3." + new_dtype_str;
+          zip_source_t *pos_src = zip_source_file(zf.get(), tmp_pos_guard.path.c_str(), 0, -1);
+          const zip_int64_t pos_idx = zip_file_add(zf.get(), new_pos_name.c_str(), pos_src, ZIP_FL_ENC_UTF_8 | ZIP_FL_OVERWRITE);
+          zip_set_file_compression(zf.get(), pos_idx, compression, 0);
+        }
       }
+      zip_from_folder(zf.get(), source_dir, source_dir, compression, &skip);
+      zf.commit(filename);
+    } else {
+      StreamingZipWriter writer(filename);
+      const std::string header_payload = header.dump() + "\n";
+      writer.add_file("header.json", header_payload.data(), header_payload.size());
+
+      // positions
+      if (!positions.empty()) {
+          const TrxScalarType target = options.positions_dtype.has_value() ? *options.positions_dtype : string_to_scalar_type(positions.dtype);
+          const std::string new_pos_name = "positions.3." + scalar_type_name(target);
+          writer.add_file_stream_begin(new_pos_name);
+          // Stream directly from mmap using for_each_positions_chunk!
+          this->for_each_positions_chunk(1024 * 1024 * 64, // 64MB chunks
+              [&](TrxScalarType src_dtype, const void *data, size_t, size_t point_count) {
+                  const size_t n = point_count * 3;
+                  if (src_dtype == target) {
+                      writer.stream_data(reinterpret_cast<const char*>(data), n * string_to_scalar_size(scalar_type_name(src_dtype)));
+                  } else {
+                      // Need to convert
+                      auto write_as = [&](auto typed_src) {
+                          switch (target) {
+                              case TrxScalarType::Float16: {
+                                  std::vector<Eigen::half> buf(n);
+                                  for (size_t i = 0; i < n; ++i) buf[i] = static_cast<Eigen::half>(static_cast<float>(typed_src[i]));
+                                  writer.stream_data(reinterpret_cast<const char*>(buf.data()), n * sizeof(Eigen::half));
+                                  break;
+                              }
+                              case TrxScalarType::Float64: {
+                                  std::vector<double> buf(n);
+                                  for (size_t i = 0; i < n; ++i) buf[i] = static_cast<double>(typed_src[i]);
+                                  writer.stream_data(reinterpret_cast<const char*>(buf.data()), n * sizeof(double));
+                                  break;
+                              }
+                              default: {
+                                  std::vector<float> buf(n);
+                                  for (size_t i = 0; i < n; ++i) buf[i] = static_cast<float>(typed_src[i]);
+                                  writer.stream_data(reinterpret_cast<const char*>(buf.data()), n * sizeof(float));
+                                  break;
+                              }
+                          }
+                      };
+                      switch (src_dtype) {
+                          case TrxScalarType::Float16: write_as(reinterpret_cast<const Eigen::half*>(data)); break;
+                          case TrxScalarType::Float64: write_as(reinterpret_cast<const double*>(data)); break;
+                          default: write_as(reinterpret_cast<const float*>(data)); break;
+                      }
+                  }
+              });
+          writer.add_file_stream_end();
+      }
+
+      // offsets
+      if (!offsets.empty()) {
+          writer.add_file("offsets." + offsets.dtype, reinterpret_cast<const char*>(offsets.to_bytes().data), offsets.to_bytes().size);
+      }
+
+      // dps
+      for (const auto& [name, arr] : data_per_streamline) {
+          std::string name_ext = "dps/" + name + "." + std::to_string(arr.cols) + "." + arr.dtype;
+          if (arr.cols == 1) name_ext = "dps/" + name + "." + arr.dtype;
+          writer.add_file(name_ext, reinterpret_cast<const char*>(arr.to_bytes().data), arr.to_bytes().size);
+      }
+
+      // dpv
+      for (const auto& [name, arr] : data_per_vertex) {
+          std::string name_ext = "dpv/" + name + "." + std::to_string(arr.cols) + "." + arr.dtype;
+          if (arr.cols == 1) name_ext = "dpv/" + name + "." + arr.dtype;
+          writer.add_file(name_ext, reinterpret_cast<const char*>(arr.to_bytes().data), arr.to_bytes().size);
+      }
+
+      // dpg
+      for (const auto& [sub_folder, map_arr] : data_per_group) {
+          for (const auto& [name, arr] : map_arr) {
+              std::string name_ext = "dpg/" + sub_folder + "/" + name + "." + arr.dtype;
+              writer.add_file(name_ext, reinterpret_cast<const char*>(arr.to_bytes().data), arr.to_bytes().size);
+          }
+      }
+
+      // groups
+      for (const auto& [name, arr] : groups) {
+          writer.add_file("groups/" + name + "." + arr.dtype, reinterpret_cast<const char*>(arr.to_bytes().data), arr.to_bytes().size);
+      }
+
+      writer.finalize();
     }
-    zip_from_folder(zf.get(), source_dir, source_dir, to_zip_compression(options.compression), &skip);
-    zf.commit(filename);
   } else {
     std::error_code ec;
     if (trx::fs::exists(filename, ec) && trx::fs::is_directory(filename, ec)) {
