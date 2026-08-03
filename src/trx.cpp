@@ -1014,10 +1014,10 @@ void AnyTrxFile::save(const std::string &filename, const TrxSaveOptions &options
     throw TrxDTypeError("Unsupported extension: " + ext);
   }
 
-  if (offsets.empty()) {
+  if (offsets.empty() && header["NB_STREAMLINES"].int_value() > 0) {
     throw TrxFormatError("Cannot save TRX without offsets data");
   }
-  if (offsets_u64.empty()) {
+  if (offsets_u64.empty() && header["NB_STREAMLINES"].int_value() > 0) {
     throw TrxFormatError("Cannot save TRX without decoded offsets");
   }
   if (header["NB_STREAMLINES"].is_number()) {
@@ -1047,9 +1047,6 @@ void AnyTrxFile::save(const std::string &filename, const TrxSaveOptions &options
 
   const std::string source_dir =
       !_uncompressed_folder_handle.empty() ? _uncompressed_folder_handle : _backing_directory;
-  if (source_dir.empty()) {
-    throw TrxIOError("TRX file has no backing directory to save from");
-  }
 
   if (save_mode == TrxSaveMode::Archive) {
     if (options.compression != TrxCompression::None) {
@@ -1080,6 +1077,9 @@ void AnyTrxFile::save(const std::string &filename, const TrxSaveOptions &options
           const zip_int64_t pos_idx = zip_file_add(zf.get(), new_pos_name.c_str(), pos_src, ZIP_FL_ENC_UTF_8 | ZIP_FL_OVERWRITE);
           zip_set_file_compression(zf.get(), pos_idx, compression, 0);
         }
+      }
+      if (source_dir.empty()) {
+        throw TrxIOError("TRX file has no backing directory to save compressed from");
       }
       zip_from_folder(zf.get(), source_dir, source_dir, compression, &skip);
       zf.commit(filename);
@@ -1177,6 +1177,10 @@ void AnyTrxFile::save(const std::string &filename, const TrxSaveOptions &options
       if (rm_dir(filename) != 0) {
         throw TrxIOError("Could not remove existing directory " + filename);
       }
+    }
+    // TrxSaveMode::Directory
+    if (source_dir.empty()) {
+      throw TrxIOError("TRX file has no backing directory to save to a directory");
     }
     trx::fs::path dest_path(filename);
     if (dest_path.has_parent_path()) {

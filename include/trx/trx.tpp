@@ -1202,7 +1202,7 @@ template <typename DT> void TrxFile<DT>::save(const std::string &filename, const
 
   TrxFile<DT> *save_trx = this;
 
-  if (!save_trx->streamlines || save_trx->streamlines->_offsets.size() == 0) {
+  if (!save_trx->streamlines || (save_trx->streamlines->_offsets.size() == 0 && save_trx->header["NB_STREAMLINES"].int_value() > 0)) {
     throw TrxFormatError("Cannot save TRX without offsets data");
   }
   if (save_trx->header["NB_STREAMLINES"].is_number()) {
