@@ -589,6 +589,11 @@ AnyTrxFile::_create_from_pointer(json header,
 
   for (auto x = dict_pointer_size.rbegin(); x != dict_pointer_size.rend(); ++x) {
     const std::string elem_filename = x->first;
+    std::string actual_file_path = elem_filename;
+    std::error_code is_reg_ec;
+    if (trx::fs::is_regular_file(trx::fs::path(root), is_reg_ec)) {
+      actual_file_path = root;
+    }
 
     std::string folder = folder_from_path(elem_filename, root);
 
@@ -605,7 +610,7 @@ AnyTrxFile::_create_from_pointer(json header,
       if (ext != "float16" && ext != "float32" && ext != "float64") {
         throw TrxDTypeError("Unsupported positions dtype: " + ext);
       }
-      trx.positions = make_typed_array(elem_filename, nb_vertices, 3, ext, std::get<0>(x->second));
+      trx.positions = make_typed_array(actual_file_path, nb_vertices, 3, ext, std::get<0>(x->second));
     } else if (base == "offsets" && (folder.empty() || folder == ".")) {
       if (size != static_cast<long long>(nb_streamlines) + 1 || dim != 1) {
         throw TrxFormatError("Wrong offsets size/dimensionality");
@@ -613,13 +618,13 @@ AnyTrxFile::_create_from_pointer(json header,
       if (ext != "uint32" && ext != "uint64") {
         throw TrxDTypeError("Unsupported offsets dtype: " + ext);
       }
-      trx.offsets = make_typed_array(elem_filename, nb_streamlines + 1, 1, ext, std::get<0>(x->second));
+      trx.offsets = make_typed_array(actual_file_path, nb_streamlines + 1, 1, ext, std::get<0>(x->second));
     } else if (folder == "dps") {
       const int nb_scalar = nb_streamlines > 0 ? static_cast<int>(size / nb_streamlines) : 0;
       if (nb_streamlines == 0 || size % nb_streamlines != 0 || nb_scalar != dim) {
         throw TrxFormatError("Wrong dps size/dimensionality");
       }
-      auto arr = make_typed_array(elem_filename, nb_streamlines, nb_scalar, ext, std::get<0>(x->second));
+      auto arr = make_typed_array(actual_file_path, nb_streamlines, nb_scalar, ext, std::get<0>(x->second));
       arr.materialize_to_owned();
       trx.data_per_streamline.emplace(base, std::move(arr));
     } else if (folder == "dpv") {
@@ -627,7 +632,7 @@ AnyTrxFile::_create_from_pointer(json header,
       if (nb_vertices == 0 || size % nb_vertices != 0 || nb_scalar != dim) {
         throw TrxFormatError("Wrong dpv size/dimensionality");
       }
-      auto arr = make_typed_array(elem_filename, nb_vertices, nb_scalar, ext, std::get<0>(x->second));
+      auto arr = make_typed_array(actual_file_path, nb_vertices, nb_scalar, ext, std::get<0>(x->second));
       arr.materialize_to_owned();
       trx.data_per_vertex.emplace(base, std::move(arr));
     } else if (folder.rfind("dpg", 0) == 0) {
@@ -636,7 +641,7 @@ AnyTrxFile::_create_from_pointer(json header,
       }
       std::string data_name = path_basename(base);
       std::string sub_folder = path_basename(folder);
-      auto arr = make_typed_array(elem_filename, 1, static_cast<int>(size), ext, std::get<0>(x->second));
+      auto arr = make_typed_array(actual_file_path, 1, static_cast<int>(size), ext, std::get<0>(x->second));
       arr.materialize_to_owned();
       trx.data_per_group[sub_folder].emplace(data_name, std::move(arr));
     } else if (folder == "groups") {
@@ -644,7 +649,7 @@ AnyTrxFile::_create_from_pointer(json header,
         throw TrxFormatError("Wrong group dimensionality");
       }
       if (ext == "uint32") {
-        auto arr = make_typed_array(elem_filename, static_cast<int>(size), 1, ext, std::get<0>(x->second));
+        auto arr = make_typed_array(actual_file_path, static_cast<int>(size), 1, ext, std::get<0>(x->second));
         arr.materialize_to_owned();
         trx.groups.emplace(base, std::move(arr));
       } else if (ext == "int8" || ext == "uint8" || ext == "int16" || ext == "uint16" || ext == "int32" ||
@@ -664,7 +669,7 @@ AnyTrxFile::_create_from_pointer(json header,
                                "' to uint32: NB_STREAMLINES exceeds the uint32 limit");
         }
 
-        auto tmp_arr = make_typed_array(elem_filename, static_cast<int>(size), 1, ext, std::get<0>(x->second));
+        auto tmp_arr = make_typed_array(actual_file_path, static_cast<int>(size), 1, ext, std::get<0>(x->second));
         tmp_arr.materialize_to_owned();
 
         TypedArray arr;
